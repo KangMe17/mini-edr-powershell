@@ -103,6 +103,79 @@ bool ContainsAny(const std::string& haystackLower, const std::vector<std::string
     return false;
 }
 
+bool IsSeparator(char c)
+{
+    return std::isspace(static_cast<unsigned char>(c)) ||
+        c == '\0' ||
+        c == '"' ||
+        c == '\'' ||
+        c == '`' ||
+        c == '=' ||
+        c == ':' ||
+        c == ';' ||
+        c == ',' ||
+        c == '(' ||
+        c == ')' ||
+        c == '[' ||
+        c == ']';
+}
+
+bool ContainsToken(const std::string& text, const std::string& token)
+{
+    if (token.empty())
+        return false;
+
+    size_t pos = text.find(token);
+
+    while (pos != std::string::npos)
+    {
+        char before = (pos == 0) ? '\0' : text[pos - 1];
+        char after = (pos + token.size() >= text.size()) ? '\0' : text[pos + token.size()];
+
+        if (IsSeparator(before) && IsSeparator(after))
+            return true;
+
+        pos = text.find(token, pos + 1);
+    }
+
+    return false;
+}
+
+bool ContainsPowerShellEncodedFlag(const std::string& script)
+{
+    std::string s = ToLowerCopy(script);
+
+    if (ContainsToken(s, "-encodedcommand"))
+        return true;
+
+    if (ContainsToken(s, "/encodedcommand"))
+        return true;
+
+    if (ContainsToken(s, "-enc"))
+        return true;
+
+    if (ContainsToken(s, "/enc"))
+        return true;
+
+    if (ContainsToken(s, "-e"))
+        return true;
+
+    return false;
+}
+
+bool ContainsInvokeExpression(const std::string& script)
+{
+    std::string s = ToLowerCopy(script);
+
+    if (ContainsToken(s, "invoke-expression"))
+        return true;
+
+    if (ContainsToken(s, "iex"))
+        return true;
+
+    return false;
+}
+
 // ================= COM =================
 IFACEMETHODIMP CAmsiProvider::QueryInterface(REFIID riid, void** ppv)
 {
@@ -338,10 +411,8 @@ bool IsSuspiciousFragment(const std::string& fragment)
 {
     std::string compact = RemoveWhitespaceLower(fragment);
 
-    return compact.find("invoke-expression") != std::string::npos ||
-        compact.find("iex") != std::string::npos ||
-        compact.find("-encodedcommand") != std::string::npos ||
-        compact.find("-enc") != std::string::npos ||
+    return ContainsInvokeExpression(fragment) ||
+        ContainsPowerShellEncodedFlag(fragment) ||
         compact.find("frombase64string") != std::string::npos ||
         compact.find("downloadstring") != std::string::npos ||
         compact.find("downloadfile") != std::string::npos ||
@@ -363,11 +434,10 @@ bool ShouldStartNewBuffer(const std::string& fragment)
     std::string compact = RemoveWhitespaceLower(fragment);
 
     return compact.find("invoke-") != std::string::npos ||
-        compact.find("iex") != std::string::npos ||
+        ContainsInvokeExpression(fragment) ||
         compact.find("powershell") != std::string::npos ||
         compact.find("pwsh") != std::string::npos ||
-        compact.find("-encodedcommand") != std::string::npos ||
-        compact.find("-enc") != std::string::npos;
+        ContainsPowerShellEncodedFlag(fragment);
 }
 
 std::string ReconstructScript(DWORD pid, const std::string& fragment)
@@ -421,8 +491,7 @@ bool HasBase64Indicator(const std::string& s)
 {
     std::string compact = RemoveWhitespaceLower(s);
 
-    return compact.find("-encodedcommand") != std::string::npos ||
-        compact.find("-enc") != std::string::npos ||
+    return ContainsPowerShellEncodedFlag(s) ||
         compact.find("frombase64string") != std::string::npos ||
         compact.find("convert]::frombase64string") != std::string::npos ||
         compact.find("system.convert") != std::string::npos;

@@ -15,6 +15,7 @@
 #include <cctype>
 #include <sstream>
 #include <algorithm>
+#include <vector>
 
 #pragma comment(lib, "winhttp.lib")
 
@@ -66,12 +67,19 @@ struct ScanMessage
 };
 #pragma pack(pop)
 
+struct LocalAnalysisResult
+{
+    std::string verdict = "ALLOW";
+    std::vector<std::string> ruleIds;
+    std::vector<std::string> reasons;
+};
+
 // ================= GLOBALS =================
 std::queue<ScanMessage> g_queue;
 std::mutex g_queueMutex;
 std::condition_variable g_queueCv;
 
-std::unordered_map<std::string, std::string> g_verdictCache;
+std::unordered_map<std::string, LocalAnalysisResult> g_verdictCache;
 std::mutex g_cacheMutex;
 
 std::mutex g_logMutex;
@@ -144,6 +152,110 @@ std::string ToLowerCopy(const std::string& input)
     return out;
 }
 
+bool IsSeparator(char c)
+{
+    return std::isspace(static_cast<unsigned char>(c)) ||
+        c == '\0' ||
+        c == '"' ||
+        c == '\'' ||
+        c == '`' ||
+        c == '=' ||
+        c == ':' ||
+        c == ';' ||
+        c == ',' ||
+        c == '(' ||
+        c == ')' ||
+        c == '[' ||
+        c == ']';
+}
+
+bool ContainsToken(const std::string& text, const std::string& token)
+{
+    if (token.empty())
+        return false;
+
+    size_t pos = text.find(token);
+
+    while (pos != std::string::npos)
+    {
+        char before = (pos == 0) ? '\0' : text[pos - 1];
+        char after = (pos + token.size() >= text.size()) ? '\0' : text[pos + token.size()];
+
+        if (IsSeparator(before) && IsSeparator(after))
+            return true;
+
+        pos = text.find(token, pos + 1);
+    }
+
+    return false;
+}
+
+bool ContainsPowerShellEncodedFlag(const std::string& script)
+{
+    std::string s = ToLowerCopy(script);
+
+    if (ContainsToken(s, "-encodedcommand"))
+        return true;
+
+    if (ContainsToken(s, "/encodedcommand"))
+        return true;
+
+    if (ContainsToken(s, "-enc"))
+        return true;
+
+    if (ContainsToken(s, "/enc"))
+        return true;
+
+    if (ContainsToken(s, "-e"))
+        return true;
+
+    return false;
+}
+
+bool ContainsInvokeExpression(const std::string& script)
+{
+    std::string s = ToLowerCopy(script);
+
+    if (ContainsToken(s, "invoke-expression"))
+        return true;
+
+    if (ContainsToken(s, "iex"))
+        return true;
+
+    return false;
+}
+
+bool ContainsDownloader(const std::string& script)
+{
+    std::string s = Normalize(script);
+
+    return s.find("downloadstring") != std::string::npos ||
+        s.find("downloadfile") != std::string::npos ||
+        s.find("invoke-webrequest") != std::string::npos ||
+        s.find("invoke-restmethod") != std::string::npos ||
+        s.find("new-objectnet.webclient") != std::string::npos ||
+        s.find("system.net.webclient") != std::string::npos ||
+        s.find("start-bitstransfer") != std::string::npos ||
+        s.find("curl") != std::string::npos ||
+        s.find("wget") != std::string::npos ||
+        s.find("http://") != std::string::npos ||
+        s.find("https://") != std::string::npos;
+}
+
+bool ContainsDynamicExecution(const std::string& script)
+{
+    std::string s = Normalize(script);
+
+    return ContainsInvokeExpression(script) ||
+        s.find("frombase64string") != std::string::npos ||
+        s.find("system.reflection") != std::string::npos ||
+        s.find("reflection.assembly") != std::string::npos ||
+        s.find("[reflection.assembly]::load") != std::string::npos ||
+        s.find("assembly]::load") != std::string::npos ||
+        s.find("add-type") != std::string::npos ||
+        s.find("start-process") != std::string::npos;
+}
+
 std::string EscapeJson(const std::string& s)
 {
     std::ostringstream out;
@@ -174,6 +286,22 @@ std::string EscapeJson(const std::string& s)
     }
 
     return out.str();
+}
+
+std::string BuildJsonStringArray(const std::vector<std::string>& items)
+{
+    std::string json = "[";
+
+    for (size_t i = 0; i < items.size(); i++)
+    {
+        if (i > 0)
+            json += ",";
+
+        json += "\"" + EscapeJson(items[i]) + "\"";
+    }
+
+    json += "]";
+    return json;
 }
 
 std::string TruncateForLog(const std::string& s, size_t maxLen = 700)
@@ -211,15 +339,10 @@ bool ContainsSuspiciousKeyword(const std::string& script)
 {
     std::string s = Normalize(script);
 
-    return s.find("-encodedcommand") != std::string::npos ||
-        s.find("-enc") != std::string::npos ||
-        s.find("invoke-expression") != std::string::npos ||
-        s.find("iex") != std::string::npos ||
-        s.find("downloadstring") != std::string::npos ||
-        s.find("downloadfile") != std::string::npos ||
-        s.find("invoke-webrequest") != std::string::npos ||
-        s.find("invoke-restmethod") != std::string::npos ||
-        s.find("frombase64string") != std::string::npos ||
+    return ContainsPowerShellEncodedFlag(script) ||
+        ContainsInvokeExpression(script) ||
+        ContainsDownloader(script) ||
+        ContainsDynamicExecution(script) ||
         s.find("mimikatz") != std::string::npos ||
         s.find("sekurlsa") != std::string::npos ||
         s.find("logonpasswords") != std::string::npos ||
@@ -273,57 +396,77 @@ bool TerminateProcessByPID(DWORD pid)
 }
 
 // ================= LOCAL IOA =================
-std::string LocalAnalyze(const std::string& script)
+LocalAnalysisResult LocalAnalyze(const std::string& script)
 {
+    LocalAnalysisResult result;
+
     if (IsPowerShellModuleManifest(script))
-        return "ALLOW";
+    {
+        result.verdict = "ALLOW";
+        return result;
+    }
 
     std::string s = Normalize(script);
 
-    // High-confidence credential theft / post-exploitation indicators
+    // Rule 1: High-confidence credential theft / post-exploitation indicators
     if (s.find("invoke-mimikatz") != std::string::npos ||
         s.find("mimikatz") != std::string::npos ||
         s.find("sekurlsa") != std::string::npos ||
         s.find("logonpasswords") != std::string::npos ||
         s.find("lsadump") != std::string::npos)
     {
-        return "TERMINATE";
+        result.verdict = "TERMINATE";
+        result.ruleIds.push_back("PS-CRED-001");
+        result.reasons.push_back("Credential dumping or post-exploitation indicator detected");
+        return result;
     }
 
-    // Suspicious downloader / execution indicators
-    if (s.find("downloadstring") != std::string::npos ||
-        s.find("downloadfile") != std::string::npos ||
-        s.find("invoke-webrequest") != std::string::npos ||
-        s.find("invoke-restmethod") != std::string::npos ||
-        s.find("new-objectnet.webclient") != std::string::npos)
+    // Rule 2: Download + Execute chain
+    if (ContainsDownloader(script) && ContainsDynamicExecution(script))
     {
-        return "ALERT";
+        result.verdict = "TERMINATE";
+        result.ruleIds.push_back("PS-DOWNLOAD-EXEC-001");
+        result.reasons.push_back("PowerShell downloads remote content and executes it dynamically");
+        return result;
     }
 
-    // Obfuscation / dynamic execution indicators
-    if (s.find("invoke-expression") != std::string::npos ||
-        s.find("iex") != std::string::npos ||
-        s.find("-encodedcommand") != std::string::npos ||
-        s.find("-enc") != std::string::npos ||
-        s.find("frombase64string") != std::string::npos)
-    {
-        return "ALERT";
-    }
-
-    // Defense evasion indicators
+    // Rule 3: AMSI bypass / Defender disable
     if (s.find("amsiutils") != std::string::npos ||
         s.find("amsiinitfailed") != std::string::npos ||
         s.find("set-mppreference") != std::string::npos ||
         s.find("disablerealtimemonitoring") != std::string::npos)
     {
-        return "ALERT";
+        result.verdict = "TERMINATE";
+        result.ruleIds.push_back("PS-DEFENSE-EVASION-001");
+        result.reasons.push_back("PowerShell attempts AMSI bypass or Defender real-time protection disable");
+        return result;
     }
 
-    return "ALLOW";
+    // Rule 4: Downloader indicators only
+    if (ContainsDownloader(script))
+    {
+        result.verdict = "ALERT";
+        result.ruleIds.push_back("PS-DOWNLOAD-001");
+        result.reasons.push_back("PowerShell contains downloader or remote URL behavior");
+        return result;
+    }
+
+    // Rule 5: Obfuscation / dynamic execution indicators
+    if (ContainsDynamicExecution(script) ||
+        ContainsPowerShellEncodedFlag(script))
+    {
+        result.verdict = "ALERT";
+        result.ruleIds.push_back("PS-DYNAMIC-EXEC-001");
+        result.reasons.push_back("PowerShell contains dynamic execution, encoded command, or in-memory execution indicator");
+        return result;
+    }
+
+    result.verdict = "ALLOW";
+    return result;
 }
 
 // ================= CACHE =================
-bool CheckCache(const std::string& hash, std::string& verdict)
+bool CheckCache(const std::string& hash, LocalAnalysisResult& result)
 {
     if (hash.empty())
         return false;
@@ -334,11 +477,11 @@ bool CheckCache(const std::string& hash, std::string& verdict)
     if (it == g_verdictCache.end())
         return false;
 
-    verdict = it->second;
+    result = it->second;
     return true;
 }
 
-void UpdateCache(const std::string& hash, const std::string& verdict)
+void UpdateCache(const std::string& hash, const LocalAnalysisResult& result)
 {
     if (hash.empty())
         return;
@@ -348,7 +491,7 @@ void UpdateCache(const std::string& hash, const std::string& verdict)
     if (g_verdictCache.size() > MAX_CACHE_SIZE)
         g_verdictCache.clear();
 
-    g_verdictCache[hash] = verdict;
+    g_verdictCache[hash] = result;
 }
 
 // ================= HTTP =================
@@ -362,7 +505,7 @@ void SetPythonCooldown()
     g_nextPythonRetryEpoch.store(NowEpoch() + PYTHON_FAILURE_COOLDOWN_SECONDS);
 }
 
-std::string BuildTelemetryJson(const ScanMessage& msg, const std::string& localVerdict)
+std::string BuildTelemetryJson(const ScanMessage& msg, const LocalAnalysisResult& analysis)
 {
     std::string process = SafeCharArrayToString(msg.process, sizeof(msg.process));
     std::string parentProcess = SafeCharArrayToString(msg.parentProcess, sizeof(msg.parentProcess));
@@ -371,18 +514,23 @@ std::string BuildTelemetryJson(const ScanMessage& msg, const std::string& localV
 
     std::string json = "{";
     json += "\"source\":\"amsi_cpp_bridge\",";
+    json += "\"agent_version\":\"cpp_bridge_v2\",";
+    json += "\"sensor_type\":\"amsi\",";
+    json += "\"received_at_human\":\"" + EscapeJson(NowString()) + "\",";
     json += "\"pid\":" + std::to_string(msg.pid) + ",";
     json += "\"ppid\":" + std::to_string(msg.parentPid) + ",";
     json += "\"process\":\"" + EscapeJson(process) + "\",";
     json += "\"parent_process\":\"" + EscapeJson(parentProcess) + "\",";
     json += "\"sha256\":\"" + EscapeJson(sha256) + "\",";
-    json += "\"local_verdict\":\"" + EscapeJson(localVerdict) + "\",";
+    json += "\"script_length\":" + std::to_string(script.size()) + ",";
+    json += "\"local_verdict\":\"" + EscapeJson(analysis.verdict) + "\",";
+    json += "\"local_rule_ids\":" + BuildJsonStringArray(analysis.ruleIds) + ",";
+    json += "\"local_reasons\":" + BuildJsonStringArray(analysis.reasons) + ",";
     json += "\"script\":\"" + EscapeJson(script) + "\"";
     json += "}";
 
     return json;
 }
-
 bool HttpPostJson(
     const wchar_t* host,
     INTERNET_PORT port,
@@ -495,7 +643,7 @@ std::string ParseVerdictFromResponse(const std::string& response)
     return "ALLOW";
 }
 
-std::string ForwardToPythonAgent(const ScanMessage& msg, const std::string& localVerdict)
+std::string ForwardToPythonAgent(const ScanMessage& msg, const LocalAnalysisResult& analysis)
 {
     if (!ENABLE_PYTHON_FORWARD)
         return "ALLOW";
@@ -503,7 +651,7 @@ std::string ForwardToPythonAgent(const ScanMessage& msg, const std::string& loca
     if (IsPythonInCooldown())
         return "ALLOW";
 
-    std::string json = BuildTelemetryJson(msg, localVerdict);
+    std::string json = BuildTelemetryJson(msg, analysis);
     std::string response;
 
     bool ok = HttpPostJson(
@@ -582,21 +730,21 @@ void WorkerThread()
         if (IsKnownBenignPowerShellNoise(script))
             continue;
 
-        std::string localVerdict;
+        LocalAnalysisResult analysis;
 
-        if (CheckCache(hash, localVerdict))
+        if (CheckCache(hash, analysis))
         {
-            if (ShouldLogByPolicy(localVerdict))
-                Log("[CACHE] HIT hash=" + hash + " verdict=" + localVerdict);
+            if (ShouldLogByPolicy(analysis.verdict))
+                Log("[CACHE] HIT hash=" + hash + " verdict=" + analysis.verdict);
         }
         else
         {
-            localVerdict = LocalAnalyze(script);
-            UpdateCache(hash, localVerdict);
+            analysis = LocalAnalyze(script);
+            UpdateCache(hash, analysis);
         }
 
-        bool shouldLog = ShouldLogByPolicy(localVerdict);
-        bool shouldForward = ShouldForwardByPolicy(localVerdict);
+        bool shouldLog = ShouldLogByPolicy(analysis.verdict);
+        bool shouldForward = ShouldForwardByPolicy(analysis.verdict);
 
         if (shouldLog)
         {
@@ -606,20 +754,26 @@ void WorkerThread()
                 " PROC=" + process +
                 " PARENT=" + parentProcess);
             Log("[HASH] " + hash);
-            Log("[LOCAL] verdict=" + localVerdict);
+            Log("[LOCAL] verdict=" + analysis.verdict);
+
+            if (!analysis.ruleIds.empty())
+                Log("[RULE_ID] " + BuildJsonStringArray(analysis.ruleIds));
+
+            if (!analysis.reasons.empty())
+                Log("[REASON] " + BuildJsonStringArray(analysis.reasons));
             Log("[SCRIPT] " + TruncateForLog(script));
         }
 
         bool alreadyTerminated = false;
 
-        if (localVerdict == "TERMINATE" && TERMINATE_ON_HIGH_CONFIDENCE)
+        if (analysis.verdict == "TERMINATE" && TERMINATE_ON_HIGH_CONFIDENCE)
         {
             alreadyTerminated = TerminateProcessByPID(msg.pid);
         }
 
         if (shouldForward)
         {
-            std::string remoteVerdict = ForwardToPythonAgent(msg, localVerdict);
+            std::string remoteVerdict = ForwardToPythonAgent(msg, analysis);
 
             if (shouldLog)
                 Log("[PYTHON_AGENT] verdict=" + remoteVerdict);

@@ -147,6 +147,33 @@ def sha256_text(text: str) -> str:
 def normalize_compact(text: str) -> str:
     return "".join((text or "").lower().split())
 
+def contains_token(text: str, token: str) -> bool:
+    if not text or not token:
+        return False
+
+    pattern = r"(?<![A-Za-z0-9_])" + re.escape(token) + r"(?![A-Za-z0-9_])"
+    return bool(re.search(pattern, text, flags=re.IGNORECASE))
+
+
+def contains_encoded_flag(text: str) -> bool:
+    text = text or ""
+
+    return any([
+        contains_token(text, "-encodedcommand"),
+        contains_token(text, "/encodedcommand"),
+        contains_token(text, "-enc"),
+        contains_token(text, "/enc"),
+        contains_token(text, "-e"),
+    ])
+
+
+def contains_invoke_expression(text: str) -> bool:
+    text = text or ""
+
+    return any([
+        contains_token(text, "invoke-expression"),
+        contains_token(text, "iex"),
+    ])
 
 def truncate(text: str, limit: int = MAX_SCRIPT_LOG_CHARS) -> str:
     text = text or ""
@@ -270,11 +297,15 @@ def is_trivial_noise(script: str) -> bool:
         return True
 
     if "psconsolehostreadline" in s or "psreadline" in s:
-        suspicious = any(k in s for k in [
-            "-encodedcommand", "-enc", "iex", "invoke-expression",
-            "downloadstring", "frombase64string", "mimikatz", "amsiutils",
-            "set-mppreference", "disablerealtimemonitoring"
-        ])
+        suspicious = (
+            contains_encoded_flag(script)
+            or contains_invoke_expression(script)
+            or any(k in s for k in [
+                "downloadstring", "frombase64string", "mimikatz", "amsiutils",
+                "set-mppreference", "disablerealtimemonitoring"
+            ])
+        )
+
         if not suspicious:
             return True
 
@@ -400,7 +431,7 @@ def extract_features_g296(script: str, event: dict | None = None) -> dict:
     f["num_frombase64"] = count_pattern(norm, r"frombase64string")
     f["bypass_policy"] = has_pattern(norm, r"-(executionpolicy|ep)\s+bypass\b")
     f["amsi_bypass"] = has_pattern(norm, r"\bamsiutils\b|\bamsi\s+fail\b|\bamsi\s+initfailed\b")
-    f["encoded_cmd"] = has_pattern(norm, r"-(e|ec|enc|enco|encod|encode|encodedcommand)\b")
+    f["encoded_cmd"] = int(contains_encoded_flag(raw))
     f["hidden_window"] = has_pattern(norm, r"-w(indowstyle)?\s+(1|h|hidden)\b")
     f["noprofile"] = int(bool(has_pattern(norm, r"-nop(rofile)?\b")) and not bool(f["has_pester_test"]))
     f["has_fromhexstring"] = has_pattern(raw.lower(), r"fromhexstring")
@@ -430,7 +461,7 @@ def extract_features_g296(script: str, event: dict | None = None) -> dict:
 
     # === 6. Behavior features ===
     f["iex_count"] = count_pattern(norm, r"\binvoke-expression\b") or count_pattern(raw.lower(), r"\binvoke-expression\b")
-    f["has_IEX_alias"] = has_pattern(raw.lower(), r"\biex\b|i\s*`\s*e\s*`\s*x")
+    f["has_IEX_alias"] = int(contains_invoke_expression(raw) or bool(re.search(r"i\s*`\s*e\s*`\s*x", raw, flags=re.IGNORECASE)))
     f["iwr_count"] = count_pattern(norm, r"\binvoke-webrequest\b|\biwr\b|\binvoke-restmethod\b|\birm\b|\bwget\b|\bcurl\b")
     f["start_process"] = count_pattern(norm, r"\bstart-process\b|\bstart(?!-)\b")
     f["reg_add"] = count_pattern(norm, r"\breg\s+add\b")
@@ -622,40 +653,164 @@ def analyze_features(features: dict) -> dict:
         "reasons": reasons,
     }
 
+def has_download_execute_chain(features: dict) -> bool:
+    has_download = any([
+        features.get("num_webclient", 0) > 0,
+        features.get("num_downloadfile", 0) > 0,
+        features.get("iwr_count", 0) > 0,
+        features.get("has_bitstransfer", 0) > 0,
+        features.get("has_certutil", 0) > 0,
+        features.get("has_webrequest", 0) > 0,
+        features.get("has_tcp_client", 0) > 0,
+        features.get("has_tcp_listener", 0) > 0,
+        features.get("http_count", 0) > 0,
+        features.get("httpsG_count", 0) > 0,
+    ])
+
+    has_execute = any([
+        features.get("iex_count", 0) > 0,
+        features.get("has_IEX_alias", 0) > 0,
+        features.get("powershell_exe", 0) > 0,
+        features.get("start_process", 0) > 0,
+        features.get("cmd_shell", 0) > 0,
+        features.get("reflected_assembly", 0) > 0,
+        features.get("has_assembly_load_b64", 0) > 0,
+    ])
+
+    is_whitelisted = features.get("has_whitelisted_download", 0) > 0
+
+    return has_download and has_execute and not is_whitelisted
+
+
+def has_defense_evasion(features: dict, script: str) -> bool:
+    s = normalize_compact(script)
+
+    return any([
+        features.get("amsi_bypass", 0) > 0,
+        features.get("add_mp_preference", 0) > 0,
+        "amsiutils" in s,
+        "amsiinitfailed" in s,
+        "set-mppreference" in s,
+        "disablerealtimemonitoring" in s,
+    ])
+
+def make_rule_result(verdict: str = "ALLOW", rule_ids=None, reasons=None) -> dict:
+    return {
+        "verdict": verdict,
+        "rule_ids": rule_ids or [],
+        "reasons": reasons or [],
+    }
+
+
+def merge_unique_list(*lists) -> list:
+    merged = []
+    seen = set()
+
+    for items in lists:
+        if not items:
+            continue
+
+        for item in items:
+            if item is None:
+                continue
+
+            item = str(item)
+            if item not in seen:
+                seen.add(item)
+                merged.append(item)
+
+    return merged
 
 # =====================================================
 # RULE-BASED BASELINE USING G2.96 FEATURES
 # =====================================================
-def rule_analyze(script: str, event: dict | None = None, features: dict | None = None) -> str:
+def rule_analyze(script: str, event: dict | None = None, features: dict | None = None) -> dict:
     event = event or {}
     features = features or extract_features(script, event)
     s = normalize_compact(script)
 
+    rule_ids = []
+    reasons = []
+
     # High-confidence post-exploitation / credential theft.
     if features.get("has_cred_dump") or "mimikatz" in s or "sekurlsa" in s or "logonpasswords" in s or "lsadump" in s:
-        return "TERMINATE"
+        return make_rule_result(
+            verdict="TERMINATE",
+            rule_ids=["PY-PS-CRED-001"],
+            reasons=["Credential dumping or post-exploitation indicator detected"],
+        )
+
+    # Download + Execute chain.
+    if has_download_execute_chain(features):
+        return make_rule_result(
+            verdict="TERMINATE",
+            rule_ids=["PY-PS-DOWNLOAD-EXEC-001"],
+            reasons=["PowerShell downloads remote content and executes it dynamically"],
+        )
+
+    # AMSI bypass / Defender disable / defense evasion.
+    if has_defense_evasion(features, script):
+        return make_rule_result(
+            verdict="TERMINATE",
+            rule_ids=["PY-PS-DEFENSE-EVASION-001"],
+            reasons=["PowerShell attempts AMSI bypass or Defender configuration modification"],
+        )
 
     # Extremely suspicious runtime combination.
     if features.get("final_risk_score", 0.0) >= G296_TERMINATE_RISK_THRESHOLD:
-        if features.get("amsi_bypass") or features.get("has_virtualalloc") or features.get("has_createthread") or features.get("has_cred_dump"):
-            return "TERMINATE"
+        if features.get("has_virtualalloc") or features.get("has_createthread") or features.get("has_cred_dump"):
+            return make_rule_result(
+                verdict="TERMINATE",
+                rule_ids=["PY-PS-HIGH-RISK-001"],
+                reasons=["High risk score with memory injection or credential theft behavior"],
+            )
 
     # Alert-worthy behavior.
-    alert_flags = [
-        "encoded_cmd", "iex_count", "has_IEX_alias", "iwr_count", "num_webclient", "num_downloadfile",
-        "num_frombase64", "has_base64_payload", "bypass_policy", "hidden_window", "noprofile",
-        "amsi_bypass", "add_mp_preference", "clear_eventlog", "reg_add", "schtasks",
-        "has_ps_registry_write", "has_persistence", "has_certutil", "suspicious_process",
-        "has_bitstransfer", "has_tcp_client", "has_tcp_listener", "has_webrequest"
+    alert_checks = [
+        ("encoded_cmd", "PY-PS-OBF-001", "EncodedCommand indicator"),
+        ("iex_count", "PY-PS-DYNAMIC-001", "Dynamic execution via Invoke-Expression"),
+        ("has_IEX_alias", "PY-PS-DYNAMIC-002", "Dynamic execution via IEX alias"),
+        ("iwr_count", "PY-PS-DOWNLOAD-001", "Web request or downloader command"),
+        ("num_webclient", "PY-PS-DOWNLOAD-002", "WebClient downloader behavior"),
+        ("num_downloadfile", "PY-PS-DOWNLOAD-003", "DownloadFile or DownloadString behavior"),
+        ("num_frombase64", "PY-PS-OBF-002", "FromBase64String indicator"),
+        ("has_base64_payload", "PY-PS-OBF-003", "Base64-like payload"),
+        ("bypass_policy", "PY-PS-EVASION-001", "ExecutionPolicy bypass"),
+        ("hidden_window", "PY-PS-STEALTH-001", "Hidden PowerShell window"),
+        ("noprofile", "PY-PS-STEALTH-002", "NoProfile execution"),
+        ("clear_eventlog", "PY-PS-EVASION-002", "Event log clearing behavior"),
+        ("reg_add", "PY-PS-PERSIST-001", "Registry modification behavior"),
+        ("schtasks", "PY-PS-PERSIST-002", "Scheduled task behavior"),
+        ("has_ps_registry_write", "PY-PS-PERSIST-003", "PowerShell registry write behavior"),
+        ("has_persistence", "PY-PS-PERSIST-004", "Persistence indicator"),
+        ("has_certutil", "PY-LOL-001", "Certutil usage"),
+        ("suspicious_process", "PY-LOL-002", "Suspicious LOLBin/process reference"),
+        ("has_bitstransfer", "PY-PS-DOWNLOAD-004", "BITS transfer behavior"),
+        ("has_tcp_client", "PY-PS-NET-001", "TCP client behavior"),
+        ("has_tcp_listener", "PY-PS-NET-002", "TCP listener behavior"),
+        ("has_webrequest", "PY-PS-NET-003", "WebRequest behavior"),
     ]
 
-    if any(features.get(k, 0) for k in alert_flags):
-        return "ALERT"
+    for feature_name, rule_id, reason in alert_checks:
+        if features.get(feature_name, 0):
+            rule_ids.append(rule_id)
+            reasons.append(reason)
+
+    if rule_ids:
+        return make_rule_result(
+            verdict="ALERT",
+            rule_ids=rule_ids,
+            reasons=reasons,
+        )
 
     if features.get("final_risk_score", 0.0) >= G296_HIGH_RISK_THRESHOLD:
-        return "ALERT"
+        return make_rule_result(
+            verdict="ALERT",
+            rule_ids=["PY-G296-HIGH-RISK-001"],
+            reasons=["G2.96 final risk score exceeds high threshold"],
+        )
 
-    return "ALLOW"
+    return make_rule_result()
 
 
 # =====================================================
@@ -786,6 +941,10 @@ def append_features_csv(features: dict, event: dict):
     row["event_path"] = event.get("path")
     row["cpp_verdict"] = event.get("local_verdict")
     row["rule_verdict"] = event.get("rule_verdict")
+    row["rule_ids"] = "|".join(event.get("rule_ids", []))
+    row["reasons"] = "|".join(event.get("reasons", []))
+    row["local_rule_ids"] = "|".join(event.get("local_rule_ids", [])) if isinstance(event.get("local_rule_ids"), list) else event.get("local_rule_ids")
+    row["local_reasons"] = "|".join(event.get("local_reasons", [])) if isinstance(event.get("local_reasons"), list) else event.get("local_reasons")
     row["ml_enabled"] = event.get("ml_enabled")
     row["ml_verdict"] = event.get("ml_verdict")
     row["ml_confidence"] = event.get("ml_confidence")
@@ -819,7 +978,8 @@ def build_detection_result(data: dict) -> dict:
 
     features = extract_features(script, data)
     analysis = analyze_features(features)
-    rule_verdict = rule_analyze(script, data, features)
+    rule_result = rule_analyze(script, data, features)
+    rule_verdict = rule_result.get("verdict", "ALLOW")
     ml_verdict, ml_confidence = ml_analyze(features)
 
     final_verdict = combine_verdict(
@@ -829,6 +989,25 @@ def build_detection_result(data: dict) -> dict:
         ml_confidence=ml_confidence,
         risk_level=analysis.get("risk_level", "LOW"),
     )
+    cpp_rule_ids = data.get("local_rule_ids", [])
+    cpp_reasons = data.get("local_reasons", [])
+
+    if not isinstance(cpp_rule_ids, list):
+        cpp_rule_ids = [str(cpp_rule_ids)]
+
+    if not isinstance(cpp_reasons, list):
+        cpp_reasons = [str(cpp_reasons)]
+
+    combined_rule_ids = merge_unique_list(
+        cpp_rule_ids,
+        rule_result.get("rule_ids", []),
+    )
+
+    combined_reasons = merge_unique_list(
+        cpp_reasons,
+        rule_result.get("reasons", []),
+        analysis.get("reasons", []),
+    )
 
     data["sha256"] = event_hash
     data["received_at"] = time.time()
@@ -836,6 +1015,9 @@ def build_detection_result(data: dict) -> dict:
     data["features"] = features
     data["data_analysis"] = analysis
     data["rule_verdict"] = rule_verdict
+    data["rule_result"] = rule_result
+    data["rule_ids"] = combined_rule_ids
+    data["reasons"] = combined_reasons
     data["ml_enabled"] = ml_enabled
     data["ml_verdict"] = ml_verdict
     data["ml_confidence"] = ml_confidence
@@ -881,7 +1063,8 @@ def worker():
             print("ML:", event.get("ml_verdict"), "CONF:", event.get("ml_confidence"))
             print("RISK:", event.get("data_analysis", {}).get("risk_level"), event.get("data_analysis", {}).get("risk_score"))
             print("RAW RISK:", event.get("data_analysis", {}).get("raw_risk_score"), "BENIGN:", event.get("data_analysis", {}).get("benign_score"))
-            print("REASONS:", ", ".join(event.get("data_analysis", {}).get("reasons", [])))
+            print("RULE IDS:", ", ".join(event.get("rule_ids", [])))
+            print("REASONS:", ", ".join(event.get("reasons", [])))
             print("FINAL:", event.get("final_verdict"))
             print("SCRIPT:", truncate(event.get("script", "")))
             write_jsonl(event)
@@ -1155,6 +1338,8 @@ def telemetry():
         "status": "received",
         "verdict": result_event.get("final_verdict", "ALLOW"),
         "rule_verdict": result_event.get("rule_verdict", "ALLOW"),
+        "rule_ids": result_event.get("rule_ids", []),
+        "reasons": result_event.get("reasons", []),
         "ml_enabled": result_event.get("ml_enabled", False),
         "ml_verdict": result_event.get("ml_verdict", "UNKNOWN"),
         "ml_confidence": result_event.get("ml_confidence", 0.0),
