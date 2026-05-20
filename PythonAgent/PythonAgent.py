@@ -9,7 +9,10 @@ import math
 import queue
 import hashlib
 import threading
+import html
+import shutil
 from collections import Counter
+from xml.etree import ElementTree as ET
 
 # Optional dependencies
 try:
@@ -34,9 +37,11 @@ except ImportError:
 
 try:
     from watchdog.observers import Observer
+    from watchdog.observers.polling import PollingObserver
     from watchdog.events import FileSystemEventHandler
 except ImportError:
     Observer = None
+    PollingObserver = None
     FileSystemEventHandler = object
 
 try:
@@ -69,9 +74,11 @@ PORT = 9001
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_DIR = os.path.join(BASE_DIR, "logs")
 MODEL_DIR = os.path.join(BASE_DIR, "model")
+QUARANTINE_DIR = os.path.join(BASE_DIR, "quarantine")
 
 EVENT_LOG_PATH = os.path.join(LOG_DIR, "edr_events.jsonl")
 FEATURE_LOG_PATH = os.path.join(LOG_DIR, "edr_features_g296.csv")
+QUARANTINE_INDEX_PATH = os.path.join(LOG_DIR, "quarantine_index.jsonl")
 
 MODEL_PATH = os.path.join(MODEL_DIR, "random_forest_model.pkl")
 FEATURE_COLUMNS_PATH = os.path.join(MODEL_DIR, "feature_columns.pkl")
@@ -79,12 +86,38 @@ FEATURE_COLUMNS_PATH = os.path.join(MODEL_DIR, "feature_columns.pkl")
 ENABLE_PROCESS_SENSOR = True
 ENABLE_FILE_SENSOR = True
 ENABLE_EVENTLOG_4104_SENSOR = True
+ENABLE_RESPONSE = os.environ.get("EDR_ENABLE_RESPONSE", "0").strip().lower() in {"1", "true", "yes", "on"}
 
-WATCH_PATHS = [
-    os.path.expanduser("~/Desktop"),
-    os.path.expanduser("~/Downloads"),
-    os.path.expanduser("~/Documents"),
-]
+def build_watch_paths():
+    env_value = os.environ.get("EDR_WATCH_PATHS", "").strip()
+    if env_value:
+        candidates = [
+            os.path.expandvars(os.path.expanduser(path.strip()))
+            for path in env_value.split(";")
+            if path.strip()
+        ]
+    else:
+        user_home = os.path.expanduser("~")
+        candidates = [
+            os.path.join(user_home, "Desktop"),
+            os.path.join(user_home, "Downloads"),
+            os.path.join(user_home, "Documents"),
+            os.path.join(user_home, "OneDrive", "Documents"),
+            os.path.join(user_home, "OneDrive", "Desktop"),
+        ]
+
+    result = []
+    seen = set()
+    for path in candidates:
+        normalized = os.path.normpath(path)
+        key = os.path.normcase(normalized)
+        if key not in seen:
+            result.append(normalized)
+            seen.add(key)
+    return result
+
+
+WATCH_PATHS = build_watch_paths()
 
 SCRIPT_EXTENSIONS = (
     ".ps1", ".psm1", ".psd1",
@@ -95,6 +128,7 @@ SCRIPT_EXTENSIONS = (
 SUSPICIOUS_PROCESS_NAMES = {
     "powershell.exe",
     "pwsh.exe",
+    "powershell_ise.exe",
     "wscript.exe",
     "cscript.exe",
     "mshta.exe",
@@ -104,12 +138,47 @@ SUSPICIOUS_PROCESS_NAMES = {
     "schtasks.exe",
 }
 
+PROTECTED_PROCESS_NAMES = {
+    "system",
+    "system idle process",
+    "registry",
+    "smss.exe",
+    "csrss.exe",
+    "wininit.exe",
+    "winlogon.exe",
+    "services.exe",
+    "lsass.exe",
+    "svchost.exe",
+    "explorer.exe",
+    "python.exe",
+    "pythonw.exe",
+}
+
+PROTECTED_COMMANDLINE_SUBSTRINGS = (
+    "pythonagent.py",
+    "start_python_agent.ps1",
+    "stop_python_agent.ps1",
+    "status_python_agent.ps1",
+    "run_response_tests.ps1",
+)
+
 POWERSHELL_EVENT_LOG = "Microsoft-Windows-PowerShell/Operational"
 POWERSHELL_EVENT_ID = 4104
+
+MAX_FILE_READ_BYTES = 1024 * 1024
+FILE_READ_RETRY_COUNT = 5
+FILE_READ_RETRY_DELAY_SECONDS = 0.2
+FILE_STABLE_READS_REQUIRED = 2
+FILE_EMPTY_MODIFIED_GRACE_SECONDS = 1.0
+SENSOR_POLL_INTERVAL_SECONDS = 0.5
+EVENTLOG_READ_BATCH_SIZE = max(1, int(os.environ.get("EDR_EVENTLOG_BATCH_SIZE", "64")))
 
 MAX_DEDUP_CACHE = 5000
 MAX_SCRIPT_LOG_CHARS = 900
 ML_MALICIOUS_CONFIDENCE_THRESHOLD = 0.90
+EVENT_QUEUE_MAX_SIZE = max(1, int(os.environ.get("EDR_EVENT_QUEUE_MAX_SIZE", "2048")))
+EVENT_WORKER_COUNT = max(1, int(os.environ.get("EDR_EVENT_WORKERS", "2")))
+TELEMETRY_RESULT_TIMEOUT_SECONDS = float(os.environ.get("EDR_TELEMETRY_RESULT_TIMEOUT_SECONDS", "0.9"))
 
 # Risk thresholds based on G2.96 final_risk_score.
 # These thresholds are intentionally conservative for runtime EDR usage.
@@ -118,10 +187,22 @@ G296_HIGH_RISK_THRESHOLD = 3.0
 G296_TERMINATE_RISK_THRESHOLD = 8.0
 
 # ================= GLOBAL STATE =================
-event_queue = queue.Queue()
+event_queue = queue.Queue(maxsize=EVENT_QUEUE_MAX_SIZE)
 seen_hashes = set()
 seen_lock = threading.Lock()
 log_lock = threading.Lock()
+console_lock = threading.Lock()
+response_lock = threading.Lock()
+queue_stats_lock = threading.Lock()
+quarantined_paths = set()
+queue_stats = {
+    "submitted": 0,
+    "processed": 0,
+    "duplicates": 0,
+    "dropped": 0,
+    "errors": 0,
+    "reply_timeouts": 0,
+}
 
 ml_model = None
 feature_columns = None
@@ -134,6 +215,7 @@ ml_enabled = False
 def ensure_dirs():
     os.makedirs(LOG_DIR, exist_ok=True)
     os.makedirs(MODEL_DIR, exist_ok=True)
+    os.makedirs(QUARANTINE_DIR, exist_ok=True)
 
 
 def now_ts():
@@ -147,33 +229,6 @@ def sha256_text(text: str) -> str:
 def normalize_compact(text: str) -> str:
     return "".join((text or "").lower().split())
 
-def contains_token(text: str, token: str) -> bool:
-    if not text or not token:
-        return False
-
-    pattern = r"(?<![A-Za-z0-9_])" + re.escape(token) + r"(?![A-Za-z0-9_])"
-    return bool(re.search(pattern, text, flags=re.IGNORECASE))
-
-
-def contains_encoded_flag(text: str) -> bool:
-    text = text or ""
-
-    return any([
-        contains_token(text, "-encodedcommand"),
-        contains_token(text, "/encodedcommand"),
-        contains_token(text, "-enc"),
-        contains_token(text, "/enc"),
-        contains_token(text, "-e"),
-    ])
-
-
-def contains_invoke_expression(text: str) -> bool:
-    text = text or ""
-
-    return any([
-        contains_token(text, "invoke-expression"),
-        contains_token(text, "iex"),
-    ])
 
 def truncate(text: str, limit: int = MAX_SCRIPT_LOG_CHARS) -> str:
     text = text or ""
@@ -182,12 +237,31 @@ def truncate(text: str, limit: int = MAX_SCRIPT_LOG_CHARS) -> str:
     return text[:limit] + " ...[truncated]"
 
 
+def safe_console_text(text: str) -> str:
+    return (text or "").encode("ascii", errors="backslashreplace").decode("ascii")
+
+
 def safe_mean(values):
     if not values:
         return 0.0
     if np is not None:
         return float(np.mean(values))
     return sum(values) / len(values)
+
+
+def bump_queue_stat(name: str, amount: int = 1):
+    with queue_stats_lock:
+        queue_stats[name] = queue_stats.get(name, 0) + amount
+
+
+def queue_snapshot() -> dict:
+    with queue_stats_lock:
+        snapshot = dict(queue_stats)
+    snapshot["size"] = event_queue.qsize()
+    snapshot["max_size"] = EVENT_QUEUE_MAX_SIZE
+    snapshot["workers"] = EVENT_WORKER_COUNT
+    snapshot["telemetry_wait_timeout_seconds"] = TELEMETRY_RESULT_TIMEOUT_SECONDS
+    return snapshot
 
 
 # =====================================================
@@ -252,6 +326,59 @@ def preprocess_normalized(text: str) -> str:
     return text
 
 
+def tokenize_ps(text: str) -> list[str]:
+    if not text:
+        return []
+    return re.findall(r"[A-Za-z_][A-Za-z0-9_-]{1,}|\$[A-Za-z_][A-Za-z0-9_]*", text.lower())
+
+
+def count_base64_strings(text: str, min_len: int = 40) -> int:
+    if not text:
+        return 0
+    pattern = rf"(?<![A-Za-z0-9+/=])(?:[A-Za-z0-9+/]{{{min_len},}}={{0,2}})(?![A-Za-z0-9+/=])"
+    return len(re.findall(pattern, text))
+
+
+def has_ascii_char_sequence(text: str) -> int:
+    if not text:
+        return 0
+    patterns = [
+        r'(?:\[char\]\s*"?\d{1,3}"?\s*(?:\+|,)?\s*){3,}',
+        r"(?:\[char\]\s*0x[0-9a-f]{1,2}\s*(?:\+|,)?\s*){3,}",
+    ]
+    return int(any(re.search(p, text, flags=re.IGNORECASE) for p in patterns))
+
+
+def compute_token_tfidf_features(tokens: list[str], vocab=None, idf=None, prefix: str = "token_tfidf_") -> dict:
+    vocab = vocab or {}
+    idf = idf or {}
+
+    if not tokens:
+        return {
+            f"{prefix}nonzero": 0,
+            f"{prefix}total": 0.0,
+            f"{prefix}max": 0.0,
+        }
+
+    counts = Counter(tokens)
+    total = sum(counts.values()) or 1
+    token_weights = {}
+
+    if vocab and idf:
+        for tok, cnt in counts.items():
+            if tok in vocab:
+                token_weights[tok] = (cnt / total) * float(idf.get(tok, 1.0))
+    else:
+        for tok, cnt in counts.items():
+            token_weights[tok] = cnt / total
+
+    return {
+        f"{prefix}nonzero": sum(1 for w in token_weights.values() if w > 0),
+        f"{prefix}total": float(sum(token_weights.values())),
+        f"{prefix}max": float(max(token_weights.values()) if token_weights else 0.0),
+    }
+
+
 def is_module_manifest(script: str) -> bool:
     s = normalize_compact(script)
     return (
@@ -297,15 +424,11 @@ def is_trivial_noise(script: str) -> bool:
         return True
 
     if "psconsolehostreadline" in s or "psreadline" in s:
-        suspicious = (
-            contains_encoded_flag(script)
-            or contains_invoke_expression(script)
-            or any(k in s for k in [
-                "downloadstring", "frombase64string", "mimikatz", "amsiutils",
-                "set-mppreference", "disablerealtimemonitoring"
-            ])
-        )
-
+        suspicious = any(k in s for k in [
+            "-encodedcommand", "-enc", "iex", "invoke-expression",
+            "downloadstring", "frombase64string", "mimikatz", "amsiutils",
+            "set-mppreference", "disablerealtimemonitoring"
+        ])
         if not suspicious:
             return True
 
@@ -344,6 +467,15 @@ def extract_features_g296(script: str, event: dict | None = None) -> dict:
     f["caret_count"] = raw.count("^")
     f["concat_string_count"] = count_pattern(raw.lower(), r"\$\w+\s*\+\s*[\"']")
 
+    # === 1b. Token / structure features ===
+    tokens = tokenize_ps(raw)
+    token_counter = Counter(tokens)
+    total_tokens = len(tokens)
+    unique_tokens = len(token_counter)
+    f["unique_token_ratio"] = (unique_tokens / total_tokens) if total_tokens else 0
+    f["max_token_length"] = max((len(t) for t in tokens), default=0)
+    f["long_token_count"] = sum(1 for t in tokens if len(t) > 30)
+
     # === 2. Payload features ===
     strings = re.findall(r'"([^"]*)"', raw) + re.findall(r"'([^']*)'", raw)
     f["num_strings"] = len(strings)
@@ -360,6 +492,7 @@ def extract_features_g296(script: str, event: dict | None = None) -> dict:
     f["has_pe_header_b64"] = has_pattern(raw, r"TVqQ")
     f["has_hex_byte_array"] = has_pattern(raw.lower(), r"(0x[0-9a-f]{1,2}\s*,){10,}")
     f["has_exe_download"] = has_pattern(raw.lower(), r"download(file|string)\s*\(.*['\"].*\.exe\s*['\"]")
+    f["base64_string_count"] = count_base64_strings(raw)
 
     f["payload_score"] = sum([f[k] > 0 for k in [
         "has_base64_payload", "has_hex_string", "has_hex_byte_array",
@@ -431,7 +564,7 @@ def extract_features_g296(script: str, event: dict | None = None) -> dict:
     f["num_frombase64"] = count_pattern(norm, r"frombase64string")
     f["bypass_policy"] = has_pattern(norm, r"-(executionpolicy|ep)\s+bypass\b")
     f["amsi_bypass"] = has_pattern(norm, r"\bamsiutils\b|\bamsi\s+fail\b|\bamsi\s+initfailed\b")
-    f["encoded_cmd"] = int(contains_encoded_flag(raw))
+    f["encoded_cmd"] = has_pattern(norm, r"-(e|ec|enc|enco|encod|encode|encodedcommand)\b")
     f["hidden_window"] = has_pattern(norm, r"-w(indowstyle)?\s+(1|h|hidden)\b")
     f["noprofile"] = int(bool(has_pattern(norm, r"-nop(rofile)?\b")) and not bool(f["has_pester_test"]))
     f["has_fromhexstring"] = has_pattern(raw.lower(), r"fromhexstring")
@@ -448,6 +581,7 @@ def extract_features_g296(script: str, event: dict | None = None) -> dict:
     f["has_expand_env_vars"] = has_pattern(norm, r"environment\s+expandenvironmentvariables")
     f["complex_format_string"] = has_pattern(raw, r"\{\d+\}.*\{\d+\}.*\{\d+\}")
     f["string_reassembly"] = has_pattern(raw, r"\$\w+\s*=\s*\$\w+\s*\+\s*\$")
+    f["ascii_char_sequence"] = has_ascii_char_sequence(raw)
 
     f["obfuscation_score"] = sum([f[k] > 0 for k in [
         "replace_count", "join_count", "xor_count", "encoded_cmd", "hidden_window",
@@ -461,7 +595,7 @@ def extract_features_g296(script: str, event: dict | None = None) -> dict:
 
     # === 6. Behavior features ===
     f["iex_count"] = count_pattern(norm, r"\binvoke-expression\b") or count_pattern(raw.lower(), r"\binvoke-expression\b")
-    f["has_IEX_alias"] = int(contains_invoke_expression(raw) or bool(re.search(r"i\s*`\s*e\s*`\s*x", raw, flags=re.IGNORECASE)))
+    f["has_IEX_alias"] = has_pattern(raw.lower(), r"\biex\b|i\s*`\s*e\s*`\s*x")
     f["iwr_count"] = count_pattern(norm, r"\binvoke-webrequest\b|\biwr\b|\binvoke-restmethod\b|\birm\b|\bwget\b|\bcurl\b")
     f["start_process"] = count_pattern(norm, r"\bstart-process\b|\bstart(?!-)\b")
     f["reg_add"] = count_pattern(norm, r"\breg\s+add\b")
@@ -537,9 +671,6 @@ def extract_features_g296(script: str, event: dict | None = None) -> dict:
         "has_new_item_file", "has_winforms", "has_batch_syntax", "has_browser_recon"
     ]])
 
-    # === G2.96 combined score ===
-    f["risk_score"] = f["obfuscation_score"] + f["payload_score"] + f["behavior_score"]
-
     has_download = (
         f["num_webclient"] > 0 or f["num_downloadfile"] > 0 or f["iwr_count"] > 0 or
         f["has_bitstransfer"] > 0 or f["has_certutil"] > 0 or f["has_webrequest"] > 0 or
@@ -548,8 +679,22 @@ def extract_features_g296(script: str, event: dict | None = None) -> dict:
 
     has_execute = (
         f["iex_count"] > 0 or f["powershell_exe"] > 0 or f["start_process"] > 0 or
-        f["cmd_shell"] > 0 or f["reflected_assembly"] > 0
+        f["cmd_shell"] > 0 or f["reflected_assembly"] > 0 or
+        f["has_call_operator"] > 0 or f["has_dot_sourcing_exec"] > 0
     )
+
+    has_decode = (
+        f["num_frombase64"] > 0 or f["has_fromhexstring"] > 0 or
+        f["base64_string_count"] > 0 or f["has_base64_payload"] > 0 or
+        f["has_hex_string"] > 0 or f["has_hex_byte_array"] > 0
+    )
+
+    f["download_execute_chain"] = int(has_download and has_execute and f["has_whitelisted_download"] == 0)
+    f["decode_execute_chain"] = int(has_decode and has_execute)
+    f.update(compute_token_tfidf_features(tokens))
+
+    # === G2.96 combined score ===
+    f["risk_score"] = f["obfuscation_score"] + f["payload_score"] + f["behavior_score"]
 
     if has_download and has_execute and f["has_whitelisted_download"] == 0:
         f["risk_score"] += 5.0
@@ -565,12 +710,6 @@ def extract_features_g296(script: str, event: dict | None = None) -> dict:
         f["risk_score"] += 3.0
 
     f["final_risk_score"] = f["risk_score"] / (f["benign_score"] + 1.0)
-
-    # Runtime-only metadata useful for logs, but not required for ML training.
-    f["runtime_source_is_amsi"] = int(event.get("source") == "amsi_cpp_bridge")
-    f["runtime_source_is_file"] = int(event.get("source") == "file_sensor")
-    f["runtime_source_is_process"] = int(event.get("source") == "process_sensor")
-    f["runtime_source_is_eventlog"] = int(event.get("source") == "eventlog_4104_sensor")
 
     return f
 
@@ -653,164 +792,40 @@ def analyze_features(features: dict) -> dict:
         "reasons": reasons,
     }
 
-def has_download_execute_chain(features: dict) -> bool:
-    has_download = any([
-        features.get("num_webclient", 0) > 0,
-        features.get("num_downloadfile", 0) > 0,
-        features.get("iwr_count", 0) > 0,
-        features.get("has_bitstransfer", 0) > 0,
-        features.get("has_certutil", 0) > 0,
-        features.get("has_webrequest", 0) > 0,
-        features.get("has_tcp_client", 0) > 0,
-        features.get("has_tcp_listener", 0) > 0,
-        features.get("http_count", 0) > 0,
-        features.get("httpsG_count", 0) > 0,
-    ])
-
-    has_execute = any([
-        features.get("iex_count", 0) > 0,
-        features.get("has_IEX_alias", 0) > 0,
-        features.get("powershell_exe", 0) > 0,
-        features.get("start_process", 0) > 0,
-        features.get("cmd_shell", 0) > 0,
-        features.get("reflected_assembly", 0) > 0,
-        features.get("has_assembly_load_b64", 0) > 0,
-    ])
-
-    is_whitelisted = features.get("has_whitelisted_download", 0) > 0
-
-    return has_download and has_execute and not is_whitelisted
-
-
-def has_defense_evasion(features: dict, script: str) -> bool:
-    s = normalize_compact(script)
-
-    return any([
-        features.get("amsi_bypass", 0) > 0,
-        features.get("add_mp_preference", 0) > 0,
-        "amsiutils" in s,
-        "amsiinitfailed" in s,
-        "set-mppreference" in s,
-        "disablerealtimemonitoring" in s,
-    ])
-
-def make_rule_result(verdict: str = "ALLOW", rule_ids=None, reasons=None) -> dict:
-    return {
-        "verdict": verdict,
-        "rule_ids": rule_ids or [],
-        "reasons": reasons or [],
-    }
-
-
-def merge_unique_list(*lists) -> list:
-    merged = []
-    seen = set()
-
-    for items in lists:
-        if not items:
-            continue
-
-        for item in items:
-            if item is None:
-                continue
-
-            item = str(item)
-            if item not in seen:
-                seen.add(item)
-                merged.append(item)
-
-    return merged
 
 # =====================================================
 # RULE-BASED BASELINE USING G2.96 FEATURES
 # =====================================================
-def rule_analyze(script: str, event: dict | None = None, features: dict | None = None) -> dict:
+def rule_analyze(script: str, event: dict | None = None, features: dict | None = None) -> str:
     event = event or {}
     features = features or extract_features(script, event)
     s = normalize_compact(script)
 
-    rule_ids = []
-    reasons = []
-
     # High-confidence post-exploitation / credential theft.
     if features.get("has_cred_dump") or "mimikatz" in s or "sekurlsa" in s or "logonpasswords" in s or "lsadump" in s:
-        return make_rule_result(
-            verdict="TERMINATE",
-            rule_ids=["PY-PS-CRED-001"],
-            reasons=["Credential dumping or post-exploitation indicator detected"],
-        )
-
-    # Download + Execute chain.
-    if has_download_execute_chain(features):
-        return make_rule_result(
-            verdict="TERMINATE",
-            rule_ids=["PY-PS-DOWNLOAD-EXEC-001"],
-            reasons=["PowerShell downloads remote content and executes it dynamically"],
-        )
-
-    # AMSI bypass / Defender disable / defense evasion.
-    if has_defense_evasion(features, script):
-        return make_rule_result(
-            verdict="TERMINATE",
-            rule_ids=["PY-PS-DEFENSE-EVASION-001"],
-            reasons=["PowerShell attempts AMSI bypass or Defender configuration modification"],
-        )
+        return "TERMINATE"
 
     # Extremely suspicious runtime combination.
     if features.get("final_risk_score", 0.0) >= G296_TERMINATE_RISK_THRESHOLD:
-        if features.get("has_virtualalloc") or features.get("has_createthread") or features.get("has_cred_dump"):
-            return make_rule_result(
-                verdict="TERMINATE",
-                rule_ids=["PY-PS-HIGH-RISK-001"],
-                reasons=["High risk score with memory injection or credential theft behavior"],
-            )
+        if features.get("amsi_bypass") or features.get("has_virtualalloc") or features.get("has_createthread") or features.get("has_cred_dump"):
+            return "TERMINATE"
 
     # Alert-worthy behavior.
-    alert_checks = [
-        ("encoded_cmd", "PY-PS-OBF-001", "EncodedCommand indicator"),
-        ("iex_count", "PY-PS-DYNAMIC-001", "Dynamic execution via Invoke-Expression"),
-        ("has_IEX_alias", "PY-PS-DYNAMIC-002", "Dynamic execution via IEX alias"),
-        ("iwr_count", "PY-PS-DOWNLOAD-001", "Web request or downloader command"),
-        ("num_webclient", "PY-PS-DOWNLOAD-002", "WebClient downloader behavior"),
-        ("num_downloadfile", "PY-PS-DOWNLOAD-003", "DownloadFile or DownloadString behavior"),
-        ("num_frombase64", "PY-PS-OBF-002", "FromBase64String indicator"),
-        ("has_base64_payload", "PY-PS-OBF-003", "Base64-like payload"),
-        ("bypass_policy", "PY-PS-EVASION-001", "ExecutionPolicy bypass"),
-        ("hidden_window", "PY-PS-STEALTH-001", "Hidden PowerShell window"),
-        ("noprofile", "PY-PS-STEALTH-002", "NoProfile execution"),
-        ("clear_eventlog", "PY-PS-EVASION-002", "Event log clearing behavior"),
-        ("reg_add", "PY-PS-PERSIST-001", "Registry modification behavior"),
-        ("schtasks", "PY-PS-PERSIST-002", "Scheduled task behavior"),
-        ("has_ps_registry_write", "PY-PS-PERSIST-003", "PowerShell registry write behavior"),
-        ("has_persistence", "PY-PS-PERSIST-004", "Persistence indicator"),
-        ("has_certutil", "PY-LOL-001", "Certutil usage"),
-        ("suspicious_process", "PY-LOL-002", "Suspicious LOLBin/process reference"),
-        ("has_bitstransfer", "PY-PS-DOWNLOAD-004", "BITS transfer behavior"),
-        ("has_tcp_client", "PY-PS-NET-001", "TCP client behavior"),
-        ("has_tcp_listener", "PY-PS-NET-002", "TCP listener behavior"),
-        ("has_webrequest", "PY-PS-NET-003", "WebRequest behavior"),
+    alert_flags = [
+        "encoded_cmd", "iex_count", "has_IEX_alias", "iwr_count", "num_webclient", "num_downloadfile",
+        "num_frombase64", "has_base64_payload", "bypass_policy", "hidden_window", "noprofile",
+        "amsi_bypass", "add_mp_preference", "clear_eventlog", "reg_add", "schtasks",
+        "has_ps_registry_write", "has_persistence", "has_certutil", "suspicious_process",
+        "has_bitstransfer", "has_tcp_client", "has_tcp_listener", "has_webrequest"
     ]
 
-    for feature_name, rule_id, reason in alert_checks:
-        if features.get(feature_name, 0):
-            rule_ids.append(rule_id)
-            reasons.append(reason)
-
-    if rule_ids:
-        return make_rule_result(
-            verdict="ALERT",
-            rule_ids=rule_ids,
-            reasons=reasons,
-        )
+    if any(features.get(k, 0) for k in alert_flags):
+        return "ALERT"
 
     if features.get("final_risk_score", 0.0) >= G296_HIGH_RISK_THRESHOLD:
-        return make_rule_result(
-            verdict="ALERT",
-            rule_ids=["PY-G296-HIGH-RISK-001"],
-            reasons=["G2.96 final risk score exceeds high threshold"],
-        )
+        return "ALERT"
 
-    return make_rule_result()
+    return "ALLOW"
 
 
 # =====================================================
@@ -848,6 +863,9 @@ def load_ml_model():
 
         if not isinstance(feature_columns, list):
             feature_columns = list(feature_columns)
+
+        if hasattr(ml_model, "n_jobs"):
+            ml_model.n_jobs = 1
 
         ml_enabled = True
         print("[ML] Model loaded successfully.")
@@ -920,6 +938,193 @@ def combine_verdict(cpp_verdict: str, rule_verdict: str, ml_verdict: str, ml_con
 
 
 # =====================================================
+# RESPONSE ENGINE
+# Opt-in runtime enforcement. Only TERMINATE verdicts are acted on.
+# =====================================================
+def response_result(action: str, success: bool, reason: str, **extra) -> dict:
+    result = {
+        "response_enabled": ENABLE_RESPONSE,
+        "response_action": action,
+        "response_success": bool(success),
+        "response_reason": reason,
+    }
+    result.update(extra)
+    return result
+
+
+def is_path_under_watch(path: str) -> bool:
+    if not path:
+        return False
+
+    try:
+        target = os.path.normcase(os.path.abspath(path))
+        for watch_path in WATCH_PATHS:
+            watch_abs = os.path.normcase(os.path.abspath(watch_path))
+            if os.path.exists(watch_abs) and os.path.commonpath([target, watch_abs]) == watch_abs:
+                return True
+    except Exception:
+        return False
+
+    return False
+
+
+def safe_quarantine_name(path: str, event_hash: str) -> str:
+    base_name = os.path.basename(path) or "quarantined_script"
+    base_name = re.sub(r"[^A-Za-z0-9._-]+", "_", base_name)
+    stamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+    hash_part = (event_hash or sha256_text(path))[:12]
+    return f"{stamp}_{hash_part}_{base_name}"
+
+
+def write_quarantine_index(record: dict):
+    with log_lock:
+        with open(QUARANTINE_INDEX_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def terminate_process_response(event: dict) -> dict:
+    if psutil is None:
+        return response_result("TERMINATE_PROCESS", False, "psutil_unavailable")
+
+    pid = safe_int(event.get("pid"), 0)
+    if pid <= 0:
+        return response_result("TERMINATE_PROCESS", False, "missing_pid")
+
+    if pid == os.getpid():
+        return response_result("TERMINATE_PROCESS", False, "refuse_to_terminate_self", target_pid=pid)
+
+    try:
+        proc = psutil.Process(pid)
+        process_name = (proc.name() or event.get("process") or "").lower()
+        try:
+            cmdline = " ".join(proc.cmdline()).lower()
+        except Exception:
+            cmdline = (event.get("script") or "").lower()
+
+        if process_name in PROTECTED_PROCESS_NAMES:
+            return response_result(
+                "TERMINATE_PROCESS",
+                False,
+                "protected_process",
+                target_pid=pid,
+                target_process=process_name,
+            )
+
+        if any(token in cmdline for token in PROTECTED_COMMANDLINE_SUBSTRINGS):
+            return response_result(
+                "TERMINATE_PROCESS",
+                False,
+                "protected_commandline",
+                target_pid=pid,
+                target_process=process_name,
+            )
+
+        proc.terminate()
+        try:
+            proc.wait(timeout=3)
+            method = "terminate"
+        except psutil.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=3)
+            method = "kill"
+
+        return response_result(
+            "TERMINATE_PROCESS",
+            True,
+            "final_verdict_TERMINATE",
+            target_pid=pid,
+            target_process=process_name,
+            response_method=method,
+        )
+
+    except psutil.NoSuchProcess:
+        return response_result("TERMINATE_PROCESS", False, "process_not_running", target_pid=pid)
+    except psutil.AccessDenied:
+        return response_result("TERMINATE_PROCESS", False, "access_denied", target_pid=pid)
+    except Exception as e:
+        return response_result("TERMINATE_PROCESS", False, f"error:{type(e).__name__}:{e}", target_pid=pid)
+
+
+def quarantine_file_response(event: dict) -> dict:
+    path = event.get("path") or ""
+    if not path:
+        return response_result("QUARANTINE_FILE", False, "missing_path")
+
+    original_path = os.path.abspath(path)
+    original_key = os.path.normcase(original_path)
+    if not os.path.isfile(original_path):
+        with response_lock:
+            if original_key in quarantined_paths:
+                return response_result("QUARANTINE_FILE", True, "already_quarantined", original_path=original_path)
+        return response_result("QUARANTINE_FILE", False, "file_not_found", original_path=original_path)
+
+    if not is_path_under_watch(original_path):
+        return response_result("QUARANTINE_FILE", False, "path_outside_watch_scope", original_path=original_path)
+
+    try:
+        os.makedirs(QUARANTINE_DIR, exist_ok=True)
+        quarantine_name = safe_quarantine_name(original_path, event.get("sha256", ""))
+        quarantine_path = os.path.join(QUARANTINE_DIR, quarantine_name)
+
+        counter = 1
+        while os.path.exists(quarantine_path):
+            root, ext = os.path.splitext(quarantine_name)
+            quarantine_path = os.path.join(QUARANTINE_DIR, f"{root}_{counter}{ext}")
+            counter += 1
+
+        shutil.move(original_path, quarantine_path)
+        with response_lock:
+            quarantined_paths.add(original_key)
+
+        record = {
+            "time": now_ts(),
+            "sha256": event.get("sha256", ""),
+            "source": event.get("source", ""),
+            "final_verdict": event.get("final_verdict", ""),
+            "original_path": original_path,
+            "quarantine_path": quarantine_path,
+        }
+        write_quarantine_index(record)
+
+        return response_result(
+            "QUARANTINE_FILE",
+            True,
+            "final_verdict_TERMINATE",
+            original_path=original_path,
+            quarantine_path=quarantine_path,
+        )
+
+    except PermissionError:
+        return response_result("QUARANTINE_FILE", False, "permission_denied", original_path=original_path)
+    except Exception as e:
+        return response_result("QUARANTINE_FILE", False, f"error:{type(e).__name__}:{e}", original_path=original_path)
+
+
+def enforce_response(event: dict) -> dict:
+    if not ENABLE_RESPONSE:
+        return response_result("DISABLED", False, "response_disabled")
+
+    if (event.get("final_verdict") or "ALLOW").upper() != "TERMINATE":
+        return response_result("NONE", False, "verdict_not_terminate")
+
+    source = event.get("source") or "unknown"
+
+    if source == "process_sensor":
+        return terminate_process_response(event)
+
+    if source == "file_sensor":
+        return quarantine_file_response(event)
+
+    if source == "eventlog_4104_sensor":
+        return response_result("LOG_ONLY", True, "eventlog_4104_has_no_reliable_pid")
+
+    if source == "amsi_cpp_bridge":
+        return response_result("DELEGATED_TO_CPP_AGENT", True, "amsi_response_handled_by_cpp_bridge")
+
+    return response_result("NONE", False, "unsupported_source")
+
+
+# =====================================================
 # LOGGING
 # =====================================================
 def write_jsonl(event: dict):
@@ -941,15 +1146,15 @@ def append_features_csv(features: dict, event: dict):
     row["event_path"] = event.get("path")
     row["cpp_verdict"] = event.get("local_verdict")
     row["rule_verdict"] = event.get("rule_verdict")
-    row["rule_ids"] = "|".join(event.get("rule_ids", []))
-    row["reasons"] = "|".join(event.get("reasons", []))
-    row["local_rule_ids"] = "|".join(event.get("local_rule_ids", [])) if isinstance(event.get("local_rule_ids"), list) else event.get("local_rule_ids")
-    row["local_reasons"] = "|".join(event.get("local_reasons", [])) if isinstance(event.get("local_reasons"), list) else event.get("local_reasons")
     row["ml_enabled"] = event.get("ml_enabled")
     row["ml_verdict"] = event.get("ml_verdict")
     row["ml_confidence"] = event.get("ml_confidence")
     row["risk_level"] = event.get("data_analysis", {}).get("risk_level")
     row["final_verdict"] = event.get("final_verdict")
+    row["response_enabled"] = event.get("response_enabled")
+    row["response_action"] = event.get("response_action")
+    row["response_success"] = event.get("response_success")
+    row["response_reason"] = event.get("response_reason")
 
     df = pd.DataFrame([row])
 
@@ -978,8 +1183,7 @@ def build_detection_result(data: dict) -> dict:
 
     features = extract_features(script, data)
     analysis = analyze_features(features)
-    rule_result = rule_analyze(script, data, features)
-    rule_verdict = rule_result.get("verdict", "ALLOW")
+    rule_verdict = rule_analyze(script, data, features)
     ml_verdict, ml_confidence = ml_analyze(features)
 
     final_verdict = combine_verdict(
@@ -989,25 +1193,6 @@ def build_detection_result(data: dict) -> dict:
         ml_confidence=ml_confidence,
         risk_level=analysis.get("risk_level", "LOW"),
     )
-    cpp_rule_ids = data.get("local_rule_ids", [])
-    cpp_reasons = data.get("local_reasons", [])
-
-    if not isinstance(cpp_rule_ids, list):
-        cpp_rule_ids = [str(cpp_rule_ids)]
-
-    if not isinstance(cpp_reasons, list):
-        cpp_reasons = [str(cpp_reasons)]
-
-    combined_rule_ids = merge_unique_list(
-        cpp_rule_ids,
-        rule_result.get("rule_ids", []),
-    )
-
-    combined_reasons = merge_unique_list(
-        cpp_reasons,
-        rule_result.get("reasons", []),
-        analysis.get("reasons", []),
-    )
 
     data["sha256"] = event_hash
     data["received_at"] = time.time()
@@ -1015,9 +1200,6 @@ def build_detection_result(data: dict) -> dict:
     data["features"] = features
     data["data_analysis"] = analysis
     data["rule_verdict"] = rule_verdict
-    data["rule_result"] = rule_result
-    data["rule_ids"] = combined_rule_ids
-    data["reasons"] = combined_reasons
     data["ml_enabled"] = ml_enabled
     data["ml_verdict"] = ml_verdict
     data["ml_confidence"] = ml_confidence
@@ -1026,7 +1208,34 @@ def build_detection_result(data: dict) -> dict:
     return data
 
 
-def submit_event(event: dict, dedup: bool = True) -> dict | None:
+def result_from_unprocessed_event(event: dict, status: str, reason: str = "") -> dict:
+    local_verdict = (event.get("local_verdict") or "ALLOW").upper()
+    if local_verdict not in {"ALLOW", "ALERT", "TERMINATE"}:
+        local_verdict = "ALLOW"
+
+    return {
+        "queue_status": status,
+        "queue_reason": reason,
+        "source": event.get("source", "unknown"),
+        "pid": event.get("pid", 0),
+        "process": event.get("process", ""),
+        "local_verdict": local_verdict,
+        "rule_verdict": "PENDING" if status == "queued_timeout" else "ALLOW",
+        "ml_enabled": ml_enabled,
+        "ml_verdict": "PENDING" if status == "queued_timeout" else "UNKNOWN",
+        "ml_confidence": 0.0,
+        "data_analysis": {
+            "risk_level": "PENDING" if status == "queued_timeout" else "LOW",
+            "risk_score": 0,
+            "raw_risk_score": 0,
+            "benign_score": 0,
+            "reasons": [reason] if reason else [],
+        },
+        "final_verdict": local_verdict,
+    }
+
+
+def submit_event(event: dict, dedup: bool = True, wait: bool = False, timeout: float | None = None) -> dict | None:
     script = event.get("script", "") or ""
     if not script:
         return None
@@ -1037,40 +1246,99 @@ def submit_event(event: dict, dedup: bool = True) -> dict | None:
     event.setdefault("source", "unknown")
     event.setdefault("local_verdict", "ALLOW")
 
-    result_event = build_detection_result(event)
+    reply_queue = queue.Queue(maxsize=1) if wait else None
+    envelope = {
+        "event": dict(event),
+        "dedup": dedup,
+        "reply_queue": reply_queue,
+    }
+
+    try:
+        event_queue.put_nowait(envelope)
+        bump_queue_stat("submitted")
+    except queue.Full:
+        bump_queue_stat("dropped")
+        return result_from_unprocessed_event(event, "queue_full", "event_queue_full")
+
+    if not wait:
+        return {
+            "queue_status": "queued",
+            "source": event.get("source", "unknown"),
+            "pid": event.get("pid", 0),
+        }
+
+    try:
+        wait_timeout = TELEMETRY_RESULT_TIMEOUT_SECONDS if timeout is None else timeout
+        return reply_queue.get(timeout=wait_timeout)
+    except queue.Empty:
+        bump_queue_stat("reply_timeouts")
+        return result_from_unprocessed_event(event, "queued_timeout", "analysis_queued")
+
+
+def log_processed_event(event: dict):
+    with console_lock:
+        print("\n========== PYTHON EDR AGENT ==========")
+        print("TIME:", event.get("received_at_human"))
+        print("SOURCE:", event.get("source"))
+        print("PID:", event.get("pid"))
+        print("PROCESS:", event.get("process"))
+        if event.get("path"):
+            print("PATH:", event.get("path"))
+        print("C++ LOCAL:", event.get("local_verdict"))
+        print("RULE:", event.get("rule_verdict"))
+        print("ML ENABLED:", event.get("ml_enabled"))
+        print("ML:", event.get("ml_verdict"), "CONF:", event.get("ml_confidence"))
+        print("RISK:", event.get("data_analysis", {}).get("risk_level"), event.get("data_analysis", {}).get("risk_score"))
+        print("RAW RISK:", event.get("data_analysis", {}).get("raw_risk_score"), "BENIGN:", event.get("data_analysis", {}).get("benign_score"))
+        print("REASONS:", ", ".join(event.get("data_analysis", {}).get("reasons", [])))
+        print("FINAL:", event.get("final_verdict"))
+        print("SCRIPT:", safe_console_text(truncate(event.get("script", ""))))
+
+    response = enforce_response(event)
+    event.update(response)
+
+    with console_lock:
+        print("RESPONSE:", event.get("response_action"), event.get("response_success"), event.get("response_reason"))
+
+    write_jsonl(event)
+    append_features_csv(event.get("features", {}), event)
+
+
+def process_event_envelope(envelope: dict) -> dict:
+    raw_event = envelope.get("event") or {}
+    dedup = bool(envelope.get("dedup", True))
+    result_event = build_detection_result(raw_event)
 
     if dedup and is_duplicate(result_event.get("sha256", "")):
+        result_event["queue_status"] = "duplicate"
+        bump_queue_stat("duplicates")
         return result_event
 
-    event_queue.put(result_event)
+    result_event["queue_status"] = "processed"
+    log_processed_event(result_event)
+    bump_queue_stat("processed")
     return result_event
 
 
-def worker():
+def worker(worker_id: int = 0):
     while True:
-        event = event_queue.get()
+        envelope = event_queue.get()
+        reply_queue = envelope.get("reply_queue") if isinstance(envelope, dict) else None
+        result_event = None
         try:
-            print("\n========== PYTHON EDR AGENT ==========")
-            print("TIME:", event.get("received_at_human"))
-            print("SOURCE:", event.get("source"))
-            print("PID:", event.get("pid"))
-            print("PROCESS:", event.get("process"))
-            if event.get("path"):
-                print("PATH:", event.get("path"))
-            print("C++ LOCAL:", event.get("local_verdict"))
-            print("RULE:", event.get("rule_verdict"))
-            print("ML ENABLED:", event.get("ml_enabled"))
-            print("ML:", event.get("ml_verdict"), "CONF:", event.get("ml_confidence"))
-            print("RISK:", event.get("data_analysis", {}).get("risk_level"), event.get("data_analysis", {}).get("risk_score"))
-            print("RAW RISK:", event.get("data_analysis", {}).get("raw_risk_score"), "BENIGN:", event.get("data_analysis", {}).get("benign_score"))
-            print("RULE IDS:", ", ".join(event.get("rule_ids", [])))
-            print("REASONS:", ", ".join(event.get("reasons", [])))
-            print("FINAL:", event.get("final_verdict"))
-            print("SCRIPT:", truncate(event.get("script", "")))
-            write_jsonl(event)
-            append_features_csv(event.get("features", {}), event)
+            result_event = process_event_envelope(envelope)
         except Exception as e:
-            print("[WORKER ERROR]", e)
+            bump_queue_stat("errors")
+            print(f"[WORKER {worker_id} ERROR]", e)
+            raw_event = envelope.get("event", {}) if isinstance(envelope, dict) else {}
+            result_event = result_from_unprocessed_event(raw_event, "worker_error", f"{type(e).__name__}:{e}")
+        finally:
+            if reply_queue is not None and result_event is not None:
+                try:
+                    reply_queue.put_nowait(result_event)
+                except queue.Full:
+                    pass
+            event_queue.task_done()
 
 
 # =====================================================
@@ -1082,75 +1350,107 @@ def process_sensor():
         return
 
     print("[SENSOR] Process Sensor started.")
-    seen_pids = set()
     try:
-        for proc in psutil.process_iter(["pid"]):
-            seen_pids.add(proc.info["pid"])
+        seen_pids = set(psutil.pids())
         print(f"[PROCESS SENSOR] Baseline existing processes: {len(seen_pids)}")
     except Exception as e:
         print("[PROCESS SENSOR INIT ERROR]", e)
+        seen_pids = set()
 
     while True:
         try:
-            for proc in psutil.process_iter(["pid", "ppid", "name", "cmdline"]):
+            current_pids = set(psutil.pids())
+            new_pids = current_pids - seen_pids
+            seen_pids = current_pids
+
+            for pid in sorted(new_pids):
                 try:
-                    info = proc.info
-                    pid = info.get("pid")
-                    name = info.get("name") or ""
+                    proc = psutil.Process(pid)
+                    name = proc.name() or ""
                     lower_name = name.lower()
-                    if pid in seen_pids:
+
+                    cmdline_list = proc.cmdline()
+                    cmdline = " ".join(cmdline_list).strip()
+                    cmdline_lower = cmdline.lower()
+
+                    if lower_name not in SUSPICIOUS_PROCESS_NAMES and not re.search(r"\b(powershell|pwsh)\b", cmdline_lower):
                         continue
-                    if lower_name not in SUSPICIOUS_PROCESS_NAMES:
+
+                    if cmdline_lower.endswith("powershell.exe") or cmdline_lower.endswith("pwsh.exe") or cmdline_lower.endswith("powershell_ise.exe"):
                         continue
-                    seen_pids.add(pid)
-                    cmdline_list = info.get("cmdline") or []
-                    cmdline = " ".join(cmdline_list)
-                    cmdline_lower = cmdline.lower().strip()
-                    if cmdline_lower.endswith("powershell.exe") or cmdline_lower.endswith("pwsh.exe"):
+
+                    if not cmdline:
                         continue
-                    if not cmdline.strip():
-                        continue
+
+                    parent_process = ""
+                    executable_path = ""
+                    try:
+                        parent = proc.parent()
+                        parent_process = parent.name() if parent else ""
+                    except Exception:
+                        parent_process = ""
+                    try:
+                        executable_path = proc.exe()
+                    except Exception:
+                        executable_path = ""
+
                     event = {
                         "source": "process_sensor",
                         "pid": pid,
-                        "ppid": info.get("ppid"),
+                        "ppid": proc.ppid(),
                         "process": name,
-                        "parent_process": "",
+                        "parent_process": parent_process,
+                        "executable_path": executable_path,
                         "script": cmdline,
                         "local_verdict": "ALLOW",
                     }
                     submit_event(event)
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                     continue
         except Exception as e:
             print("[PROCESS SENSOR ERROR]", e)
-        time.sleep(1)
+        time.sleep(SENSOR_POLL_INTERVAL_SECONDS)
 
 
 # =====================================================
 # SENSOR 2: FILE SENSOR
 # =====================================================
 class ScriptFileHandler(FileSystemEventHandler):
+    def __init__(self):
+        self.state_lock = threading.Lock()
+        self.last_emitted_content = {}
+        self.known_paths = set()
+
     def on_created(self, event):
-        self.handle_event(event)
+        self.handle_event(event, "created")
 
     def on_modified(self, event):
-        self.handle_event(event)
+        self.handle_event(event, "modified")
 
-    def handle_event(self, event):
+    def on_moved(self, event):
+        if getattr(event, "is_directory", False):
+            return
+        self.handle_path(getattr(event, "dest_path", ""), "moved")
+
+    def handle_event(self, event, event_type):
         if getattr(event, "is_directory", False):
             return
         path = getattr(event, "src_path", "")
+        self.handle_path(path, event_type)
+
+    def handle_path(self, path, event_type):
         if not path.lower().endswith(SCRIPT_EXTENSIONS):
             return
+
+        normalized_event_type = self.normalize_event_type(path, event_type)
+        content = self.read_content_for_event(path, normalized_event_type)
+        if content is None or not content.strip():
+            return
+
+        if not self.should_emit(path, content, normalized_event_type):
+            return
+
         try:
-            time.sleep(0.2)
-            if not os.path.exists(path):
-                return
-            with open(path, "r", encoding="utf-8", errors="ignore") as f:
-                content = f.read()
-            if not content.strip():
-                return
             event_data = {
                 "source": "file_sensor",
                 "pid": 0,
@@ -1158,12 +1458,101 @@ class ScriptFileHandler(FileSystemEventHandler):
                 "process": "file_system",
                 "parent_process": "",
                 "path": path,
+                "file_event_type": normalized_event_type,
                 "script": content,
                 "local_verdict": "ALLOW",
             }
             submit_event(event_data)
+            with self.state_lock:
+                self.last_emitted_content[path] = content
+                self.known_paths.add(path)
         except Exception as e:
             print("[FILE SENSOR ERROR]", e)
+
+    def normalize_event_type(self, path, event_type):
+        if event_type == "moved":
+            return "moved"
+
+        with self.state_lock:
+            seen_before = path in self.known_paths
+
+        if seen_before:
+            return "modified"
+        return "created"
+
+    def should_emit(self, path, content, event_type):
+        with self.state_lock:
+            previous_content = self.last_emitted_content.get(path)
+
+        if event_type == "modified" and previous_content == content:
+            return False
+        return True
+
+    def read_content_for_event(self, path, event_type):
+        if event_type == "created":
+            return self.read_created_content(path)
+        return self.read_stable_content(path, event_type)
+
+    def read_created_content(self, path):
+        for _ in range(FILE_READ_RETRY_COUNT):
+            try:
+                if not os.path.exists(path):
+                    time.sleep(FILE_READ_RETRY_DELAY_SECONDS)
+                    continue
+                if os.path.getsize(path) > MAX_FILE_READ_BYTES:
+                    print("[FILE SENSOR] Skip large file:", path)
+                    return None
+                with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                    content = f.read()
+                if not content:
+                    time.sleep(FILE_READ_RETRY_DELAY_SECONDS)
+                    continue
+                return content
+            except (FileNotFoundError, PermissionError):
+                time.sleep(FILE_READ_RETRY_DELAY_SECONDS)
+            except Exception as e:
+                print("[FILE SENSOR READ ERROR]", e)
+                return None
+        print("[FILE SENSOR] Cannot read created file after retries:", path)
+        return None
+
+    def read_stable_content(self, path, event_type):
+        last_content = None
+        stable_reads = 0
+
+        for _ in range(FILE_READ_RETRY_COUNT):
+            try:
+                if not os.path.exists(path):
+                    time.sleep(FILE_READ_RETRY_DELAY_SECONDS)
+                    continue
+                if os.path.getsize(path) > MAX_FILE_READ_BYTES:
+                    print("[FILE SENSOR] Skip large file:", path)
+                    return None
+                with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                    content = f.read()
+
+                if event_type == "modified" and not content:
+                    time.sleep(FILE_EMPTY_MODIFIED_GRACE_SECONDS)
+                    continue
+
+                if content == last_content:
+                    stable_reads += 1
+                else:
+                    last_content = content
+                    stable_reads = 1
+
+                if stable_reads >= FILE_STABLE_READS_REQUIRED:
+                    return content
+
+                time.sleep(FILE_READ_RETRY_DELAY_SECONDS)
+            except (FileNotFoundError, PermissionError):
+                time.sleep(FILE_READ_RETRY_DELAY_SECONDS)
+            except Exception as e:
+                print("[FILE SENSOR READ ERROR]", e)
+                return None
+
+        print("[FILE SENSOR] Cannot read stable file after retries:", path)
+        return None
 
 
 def file_sensor():
@@ -1171,7 +1560,15 @@ def file_sensor():
         print("[FILE SENSOR] watchdog not installed. Sensor disabled.")
         return
     print("[SENSOR] File Sensor started.")
-    observer = Observer()
+    try:
+        observer = Observer()
+        print("[FILE SENSOR] Observer:", type(observer).__name__)
+    except Exception as e:
+        if PollingObserver is None:
+            print("[FILE SENSOR] Cannot create observer. Sensor disabled.", e)
+            return
+        observer = PollingObserver()
+        print("[FILE SENSOR] Fallback observer:", type(observer).__name__)
     handler = ScriptFileHandler()
     watched_any = False
     for path in WATCH_PATHS:
@@ -1194,10 +1591,85 @@ def file_sensor():
 # =====================================================
 # SENSOR 3: EVENT LOG 4104 SENSOR
 # =====================================================
+def safe_int(value, default=0):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def xml_text(node):
+    return node.text if node is not None and node.text is not None else ""
+
+
+def close_event_handle(handle):
+    if handle is None or win32evtlog is None:
+        return
+    try:
+        win32evtlog.EvtClose(handle)
+    except Exception:
+        pass
+
+
+def parse_4104_event_xml(xml):
+    result = {
+        "record_id": 0,
+        "event_id": 0,
+        "event_time": "",
+        "computer": "",
+        "script_block_text": "",
+        "path": "",
+        "message_number": "",
+        "message_total": "",
+    }
+
+    try:
+        root = ET.fromstring(xml)
+        ns = {"e": "http://schemas.microsoft.com/win/2004/08/events/event"}
+
+        system = root.find("e:System", ns)
+        if system is not None:
+            result["event_id"] = safe_int(xml_text(system.find("e:EventID", ns)), 0)
+            result["record_id"] = safe_int(xml_text(system.find("e:EventRecordID", ns)), 0)
+            result["computer"] = xml_text(system.find("e:Computer", ns))
+
+            time_created = system.find("e:TimeCreated", ns)
+            if time_created is not None:
+                result["event_time"] = time_created.attrib.get("SystemTime", "")
+
+        event_data = root.find("e:EventData", ns)
+        if event_data is not None:
+            for item in event_data.findall("e:Data", ns):
+                name = item.attrib.get("Name", "")
+                value = html.unescape(xml_text(item))
+                if name == "ScriptBlockText":
+                    result["script_block_text"] = value
+                elif name == "Path":
+                    result["path"] = value
+                elif name == "MessageNumber":
+                    result["message_number"] = value
+                elif name == "MessageTotal":
+                    result["message_total"] = value
+
+        if not result["script_block_text"]:
+            fallback_blocks = re.findall(
+                r"<Data[^>]*>(.*?)</Data>",
+                xml,
+                flags=re.DOTALL
+            )
+            result["script_block_text"] = "\n".join(html.unescape(x) for x in fallback_blocks)
+
+    except Exception as e:
+        print("[EVENTLOG XML PARSE ERROR]", e)
+
+    return result
+
+
 def get_latest_4104_record_id():
     if win32evtlog is None:
         return 0
 
+    handle = None
     try:
         query = "*[System[(EventID=4104)]]"
 
@@ -1213,16 +1685,13 @@ def get_latest_4104_record_id():
             return 0
 
         xml = win32evtlog.EvtRender(events[0], win32evtlog.EvtRenderEventXml)
-
-        record_match = re.search(r"<EventRecordID>(\d+)</EventRecordID>", xml)
-        if not record_match:
-            return 0
-
-        return int(record_match.group(1))
+        return parse_4104_event_xml(xml).get("record_id", 0)
 
     except Exception as e:
         print("[EVENTLOG SENSOR INIT ERROR]", e)
         return 0
+    finally:
+        close_event_handle(handle)
 
 def eventlog_4104_sensor():
     print("[SENSOR] Event Log 4104 Sensor started.")
@@ -1237,6 +1706,7 @@ def eventlog_4104_sensor():
     query = "*[System[(EventID=4104)]]"
 
     while True:
+        handle = None
         try:
             handle = win32evtlog.EvtQuery(
                 POWERSHELL_EVENT_LOG,
@@ -1244,53 +1714,39 @@ def eventlog_4104_sensor():
                 query
             )
 
-            events = win32evtlog.EvtNext(handle, 20)
             batch = []
+            reached_known_record = False
 
-            for ev in events:
-                xml = win32evtlog.EvtRender(ev, win32evtlog.EvtRenderEventXml)
+            while True:
+                events = win32evtlog.EvtNext(handle, EVENTLOG_READ_BATCH_SIZE)
+                if not events:
+                    break
 
-                record_match = re.search(r"<EventRecordID>(\d+)</EventRecordID>", xml)
-                if not record_match:
-                    continue
+                for ev in events:
+                    xml = win32evtlog.EvtRender(ev, win32evtlog.EvtRenderEventXml)
+                    parsed = parse_4104_event_xml(xml)
 
-                record_id = int(record_match.group(1))
-                if record_id <= last_record_id:
-                    continue
+                    record_id = parsed.get("record_id", 0)
+                    if not record_id:
+                        continue
 
-                script_blocks = re.findall(
-                    r"<Data Name=['\"]ScriptBlockText['\"]>(.*?)</Data>",
-                    xml,
-                    flags=re.DOTALL
-                )
+                    if record_id <= last_record_id:
+                        reached_known_record = True
+                        break
 
-                if not script_blocks:
-                    # Fallback: sometimes payload is in generic Data fields
-                    script_blocks = re.findall(
-                        r"<Data[^>]*>(.*?)</Data>",
-                        xml,
-                        flags=re.DOTALL
-                    )
+                    message = parsed.get("script_block_text", "")
 
-                message = "\n".join(script_blocks)
+                    if not message.strip():
+                        continue
 
-                # XML escape cleanup
-                message = (
-                    message.replace("&lt;", "<")
-                    .replace("&gt;", ">")
-                    .replace("&amp;", "&")
-                    .replace("&quot;", '"')
-                    .replace("&apos;", "'")
-                )
+                    batch.append((record_id, message, parsed))
 
-                if not message.strip():
-                    continue
-
-                batch.append((record_id, message))
+                if reached_known_record:
+                    break
 
             batch.sort(key=lambda x: x[0])
 
-            for record_id, message in batch:
+            for record_id, message, parsed in batch:
                 last_record_id = max(last_record_id, record_id)
 
                 event = {
@@ -1301,6 +1757,11 @@ def eventlog_4104_sensor():
                     "parent_process": "",
                     "event_id": 4104,
                     "record_id": record_id,
+                    "event_time": parsed.get("event_time", ""),
+                    "computer": parsed.get("computer", ""),
+                    "path": parsed.get("path", ""),
+                    "message_number": parsed.get("message_number", ""),
+                    "message_total": parsed.get("message_total", ""),
                     "script": message,
                     "local_verdict": "ALLOW",
                 }
@@ -1309,8 +1770,10 @@ def eventlog_4104_sensor():
 
         except Exception as e:
             print("[EVENTLOG SENSOR ERROR]", e)
+        finally:
+            close_event_handle(handle)
 
-        time.sleep(2)
+        time.sleep(SENSOR_POLL_INTERVAL_SECONDS)
 
 
 # =====================================================
@@ -1330,16 +1793,19 @@ def telemetry():
     if not script:
         return jsonify({"status": "empty_script", "verdict": "ALLOW"}), 200
 
-    result_event = submit_event(data, dedup=True)
+    result_event = submit_event(
+        data,
+        dedup=True,
+        wait=True,
+        timeout=TELEMETRY_RESULT_TIMEOUT_SECONDS,
+    )
     if result_event is None:
         return jsonify({"status": "ignored_noise", "verdict": "ALLOW"}), 200
 
     return jsonify({
-        "status": "received",
+        "status": result_event.get("queue_status", "received"),
         "verdict": result_event.get("final_verdict", "ALLOW"),
         "rule_verdict": result_event.get("rule_verdict", "ALLOW"),
-        "rule_ids": result_event.get("rule_ids", []),
-        "reasons": result_event.get("reasons", []),
         "ml_enabled": result_event.get("ml_enabled", False),
         "ml_verdict": result_event.get("ml_verdict", "UNKNOWN"),
         "ml_confidence": result_event.get("ml_confidence", 0.0),
@@ -1358,6 +1824,11 @@ def health():
         "model_path": MODEL_PATH,
         "feature_columns_path": FEATURE_COLUMNS_PATH,
         "feature_version": "G2.96",
+        "response_enabled": ENABLE_RESPONSE,
+        "quarantine_path": QUARANTINE_DIR,
+        "quarantine_index_path": QUARANTINE_INDEX_PATH,
+        "agent_pid": os.getpid(),
+        "queue": queue_snapshot(),
         "process_sensor": ENABLE_PROCESS_SENSOR and psutil is not None,
         "file_sensor": ENABLE_FILE_SENSOR and Observer is not None,
         "eventlog_4104_sensor": ENABLE_EVENTLOG_4104_SENSOR and win32evtlog is not None,
@@ -1382,7 +1853,8 @@ if __name__ == "__main__":
     ensure_dirs()
     load_ml_model()
 
-    threading.Thread(target=worker, daemon=True).start()
+    for worker_id in range(EVENT_WORKER_COUNT):
+        threading.Thread(target=worker, args=(worker_id,), daemon=True).start()
 
     if ENABLE_PROCESS_SENSOR:
         threading.Thread(target=process_sensor, daemon=True).start()
@@ -1396,5 +1868,8 @@ if __name__ == "__main__":
     print(f"[+] Logs: {LOG_DIR}")
     print(f"[+] ML model path: {MODEL_PATH}")
     print(f"[+] Feature columns path: {FEATURE_COLUMNS_PATH}")
+    print(f"[+] Response enabled: {ENABLE_RESPONSE}")
+    print(f"[+] Quarantine: {QUARANTINE_DIR}")
+    print(f"[+] Event queue: max={EVENT_QUEUE_MAX_SIZE} workers={EVENT_WORKER_COUNT}")
 
     app.run(host=HOST, port=PORT)
